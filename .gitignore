@@ -1,2 +1,36 @@
-# Shallow-cloned MIT reference repositories used for architecture study only.
+# Reference repositories are local-only architecture study checkouts.
 _references/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Local state, media, generated clips, and logs
+.data/
+data/
+outputs/
+renders/
+tmp/
+temp/
+logs/
+*.log
+
+# Secrets and editor/OS noise
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

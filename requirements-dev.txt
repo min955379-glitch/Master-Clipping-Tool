@@ -1,0 +1,3 @@
+# Runtime + MCP + test/lint tools.
+-c constraints-windows-py311.txt
+-e .[dev]
