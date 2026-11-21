@@ -15,12 +15,26 @@ Phase 3 processing and integration are implemented, including local ingest, Olla
 - **Ollama** is optional for local AI. Install it separately, start its service at `http://localhost:11434`, and pull a model such as `qwen2.5:7b` before selecting it.
 - **Gemini** is opt-in. Set `GEMINI_API_KEY` in the environment for the process that launches the API/CLI/MCP server. The key is not saved in job records or returned by the API.
 
-## One-click setup and launch
+## Windows 10/11 quick start
 
-1. Install the prerequisites above.
-2. Run `setup.bat` from the repository root. It checks Python, FFmpeg/ffprobe, Node/npm and optional Ollama availability; creates `.venv`; installs the pinned Python packages and web dependencies; and probes FFmpeg's supported H.264 encoders.
-3. Run `run.bat`. It starts the loopback-only FastAPI service on port 8000, starts Vite on port 5173 and opens the studio in your browser.
-4. Choose a local video or paste a YouTube/Twitch URL, select the provider/layout/caption preset and add optional custom direction. The UI polls job progress and shows in-browser previews with MP4 download links.
+Install **CPython 3.11 x64** and **Node.js 22.12+ (or 20.19+)** first. Open PowerShell in the repository root (the folder containing `setup.bat`) and install FFmpeg with WinGet:
+
+```powershell
+winget install -e --id Gyan.FFmpeg
+```
+
+Close and reopen PowerShell so the updated `PATH` is loaded. Then, from the repository root, run setup, verify the encoder probe, run the real local smoke test, and launch the studio:
+
+```powershell
+.\setup.bat
+.\.venv\Scripts\python.exe -m core.encoder --check
+.\.venv\Scripts\python.exe test_pipeline.py --live
+.\run.bat
+```
+
+For AMF verification, check that the encoder probe prints `Selected encoder: h264_amf` and lists `h264_amf` among the supported encoders. If it selects `h264_nvenc` or `libx264` instead, FFmpeg or the installed graphics driver is not exposing AMF; `libx264` is the CPU fallback. The live smoke test creates and renders a synthetic 15-second clip, then probes the exported file. Its Ollama connectivity result is informational; a local model is only needed to process your own source. `setup.bat` installs the pinned Python and web dependencies and reports the encoder selection; it may pause for a keypress when it completes.
+
+`run.bat` starts the loopback-only FastAPI service on port 8000, starts Vite on port 5173 and opens the studio in your browser. Choose a local video or paste a YouTube/Twitch URL, select the provider/layout/caption preset and add optional custom direction. The UI polls job progress and shows in-browser previews with MP4 download links.
 
 Uploaded source media, job snapshots, captions and exports are stored per user under `%LOCALAPPDATA%\FrameForge\jobs\<job-id>` on Windows. Set `FRAMEFORGE_DATA_DIR` to choose another local storage root. The API accepts local uploads up to 16 GB by default; adjust `FRAMEFORGE_MAX_UPLOAD_BYTES` before launch if needed.
 
