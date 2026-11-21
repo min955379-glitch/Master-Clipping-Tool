@@ -1,0 +1,15 @@
+# Python 3.11 Windows x64 runtime pins. MediaPipe 0.10.21 pulls an OpenCV
+# GUI/contrib wheel; setup replaces it with the matching headless wheel after
+# installation so the shared cv2 files stay on one version.
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+httpx==0.28.1
+python-multipart==0.0.34
+yt-dlp==2026.10.26
+numpy==1.26.4
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+faster-whisper==1.2.1
+mcp==2.3.0

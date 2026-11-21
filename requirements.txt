@@ -1,0 +1,3 @@
+# Install the pinned runtime and stdio MCP adapter from pyproject.toml.
+-c constraints-windows-py311.txt
+-e .
