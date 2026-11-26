@@ -9,8 +9,8 @@ if not exist "%PYTHON%" (
   pause
   exit /b 1
 )
-if not exist "%ROOT%\web\node_modules\.bin\vite.cmd" (
-  echo [ERROR] Web dependencies are missing. Run setup.bat first.
+if not exist "%ROOT%\web\dist\index.html" (
+  echo [ERROR] The built studio UI is missing. Run setup.bat to build web\dist first.
   pause
   exit /b 1
 )
@@ -21,7 +21,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-start "Clip Studio API" /D "%ROOT%" "%PYTHON%" -m uvicorn api.server:app --host 127.0.0.1 --port 8000
-start "Clip Studio Web" /D "%ROOT%\web" cmd /k "npm run dev -- --host 127.0.0.1"
+echo Starting FrameForge at http://127.0.0.1:8000
+echo Close the server window to stop the local studio.
+start "FrameForge Local Server" /D "%ROOT%" "%PYTHON%" -m uvicorn api.server:app --host 127.0.0.1 --port 8000
 timeout /t 3 /nobreak >nul
-start "" "http://127.0.0.1:5173"
+start "" "http://127.0.0.1:8000"

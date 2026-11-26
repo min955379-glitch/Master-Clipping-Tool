@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,22 @@ class ApiTests(unittest.TestCase):
             ],
         )
 
+    def test_production_ui_and_spa_routes_do_not_shadow_api_or_docs(self) -> None:
+        if not (server.WEB_DIST / "index.html").is_file():
+            self.skipTest("web/dist has not been built")
+        homepage = self.client.get("/")
+        self.assertEqual(homepage.status_code, 200)
+        self.assertIn("FrameForge", homepage.text)
+        deep_link = self.client.get("/studio/settings/providers")
+        self.assertEqual(deep_link.status_code, 200)
+        self.assertIn("<div id=\"root\"></div>", deep_link.text)
+        self.assertEqual(self.client.get("/api/health").json()["status"], "ok")
+        api_miss = self.client.get("/api/not-a-route")
+        self.assertEqual(api_miss.status_code, 404)
+        self.assertNotIn('<div id="root"></div>', api_miss.text)
+        self.assertEqual(self.client.get("/openapi.json").status_code, 200)
+        self.assertEqual(self.client.get("/docs").status_code, 200)
+
     def test_health_runtime_and_job_flow(self) -> None:
         self.assertEqual(self.client.get("/api/health").json()["pipeline"], "ready")
         runtime = self.client.get("/api/runtime")
@@ -88,6 +105,88 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(downloaded.content, b"mock mp4")
         persisted = (Path(self.temporary.name) / job_id / "job.json").read_text(encoding="utf-8")
         self.assertNotIn("never-persist-this", persisted)
+
+    def test_provider_settings_save_and_test_redacts_keys_and_preserves_them_on_test_failure(self) -> None:
+        settings_root = Path(self.temporary.name) / "config"
+        api_key = "sk-local-provider-test-secret"
+        with patch.dict(os.environ, {"FRAMEFORGE_DATA_DIR": str(settings_root), "OPENAI_API_KEY": ""}):
+            with patch("api.server.test_provider_connection", return_value="Connected to Openai (gpt-test).") as probe:
+                response = self.client.post(
+                    "/api/settings/test",
+                    json={
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": api_key,
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["ok"])
+            self.assertNotIn(api_key, response.text)
+            self.assertEqual(probe.call_args.kwargs["api_key"], api_key)
+            public = self.client.get("/api/settings")
+            self.assertTrue(public.json()["providers"]["openai"]["configured"])
+            self.assertNotIn(api_key, public.text)
+
+            with patch(
+                "api.server.test_provider_connection",
+                side_effect=RuntimeError(f"provider echoed {api_key}, but is offline"),
+            ):
+                failed = self.client.post(
+                    "/api/settings/test",
+                    json={
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "",
+                    },
+                )
+            self.assertEqual(failed.status_code, 200)
+            self.assertFalse(failed.json()["ok"])
+            self.assertIn("[redacted]", failed.json()["message"])
+            self.assertNotIn(api_key, failed.text)
+            stored = (settings_root / "settings.json").read_text(encoding="utf-8")
+            self.assertIn(api_key, stored)
+
+    def test_provider_settings_reject_credential_bearing_base_urls(self) -> None:
+        settings_root = Path(self.temporary.name) / "config"
+        with patch.dict(os.environ, {"FRAMEFORGE_DATA_DIR": str(settings_root)}):
+            response = self.client.post(
+                "/api/settings/test",
+                json={
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "base_url": "https://user:secret@provider.example/v1",
+                    "api_key": "",
+                },
+            )
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("secret", response.text)
+        self.assertFalse((settings_root / "settings.json").exists())
+
+    def test_delete_clip_removes_video_caption_and_job_entry(self) -> None:
+        with patch("api.server.run_pipeline", side_effect=self._successful_pipeline):
+            submitted = self.client.post(
+                "/api/jobs",
+                json={"source": "https://youtu.be/abcdefghijk", "clip_count": 1},
+            )
+        job_id = submitted.json()["job_id"]
+        clip = self.client.get(f"/api/jobs/{job_id}").json()["clips"][0]
+        video_path = Path(self.temporary.name) / job_id / "exports" / clip["file_name"]
+        caption_path = Path(self.temporary.name) / job_id / "captions" / f"{video_path.stem}.ass"
+        caption_path.parent.mkdir(parents=True, exist_ok=True)
+        caption_path.write_text("ASS caption sidecar", encoding="utf-8")
+
+        deleted = self.client.delete(f"/api/clips/{clip['clip_id']}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertTrue(deleted.json()["deleted"])
+        self.assertFalse(video_path.exists())
+        self.assertFalse(caption_path.exists())
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}").json()["clips"], [])
+        persisted = (Path(self.temporary.name) / job_id / "job.json").read_text(encoding="utf-8")
+        self.assertIn('"clips": []', persisted)
+        self.assertNotIn(clip["file_name"], persisted)
+        self.assertEqual(self.client.delete("/api/clips/not-a-valid-token").status_code, 404)
 
     def test_multipart_upload_is_saved_in_job_local_storage(self) -> None:
         with patch("api.server.run_pipeline", side_effect=self._successful_pipeline):

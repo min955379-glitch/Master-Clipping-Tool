@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from core.encoder import EncoderSelection, detect_encoder
+from core.env import load_local_env
 from core.ingest import IngestServices, probe_media
 from core.models import (
     CaptionPreset,
@@ -342,6 +343,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_local_env()
     args = _parser().parse_args(argv)
     if not args.live:
         summary = _mocked_check()

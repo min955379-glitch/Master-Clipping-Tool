@@ -1,13 +1,13 @@
 # FrameForge — Architecture and Reference Audit
 
-**Status (2026-11-21):** Phase 1 architecture audit and Phase 2 Windows/web scaffolding are complete. Phase 3's shared pipeline, five media modules, FastAPI/React UI, CLI/MCP adapters and mocked/live smoke harness are implemented. Automated checks pass in the Linux sandbox. FFmpeg is not installed here, so no real render, Windows setup run, or AMF hardware check has been performed; the user will run `setup.bat` and verify `h264_amf` on Windows.
+**Status (2026-11-21):** The shared local pipeline and V2 polish are implemented: persistent multi-provider settings, clip deletion, the editorial charcoal/ivory/gold interface, and a production UI served by FastAPI. Unit/API/build verification runs in the sandbox; FFmpeg is not installed here, so no real render or Windows AMF/NVENC hardware check has been performed. Verify the encoder and rendering on hardware that provides the target FFmpeg encoders.
 
 ## 1. Design contract
 
 - **Windows-first, local-first:** CPython 3.11 x64, FFmpeg/ffprobe and a local React/Vite studio. Job snapshots, uploads, captions and exports use per-user local storage. The only intended network use is a chosen remote source/caption, the selected AI provider, or package/setup downloads.
 - **One engine, three surfaces:** FastAPI, `python -m core.cli` / `python cli.py`, and MCP/stdio all call `core.pipeline.run_pipeline`. They do not implement separate clipping logic.
 - **Small, Windows-compatible runtime:** pinned FastAPI/Uvicorn/Pydantic, yt-dlp, OpenCV headless, MediaPipe and faster-whisper. Transcription is CPU/int8; PyTorch and Docker are not hard requirements. No CUDA is required.
-- **No silent media upload or social posting:** Gemini is an explicit cloud provider choice and receives the selection prompt/context, not a video upload. There are no social publishing integrations.
+- **No silent media upload or social posting:** Cloud providers are explicit choices and receive transcript/audio-event context, not video uploads. API keys and settings stay in the user's local data folder; there are no social publishing integrations.
 - **Clean-room implementation:** the MIT references below were studied for patterns only. Their source, model weights, fonts and other assets are not shipped or imported into the implementation.
 
 ## 2. MIT reference audit
@@ -32,16 +32,16 @@ MCP tools / stdio ──────────────┘           │
                                ingest → brain → reframe → captions → render
 ```
 
-`core/models.py` defines the Pydantic contracts. `core/pipeline.py` owns orchestration, per-clip error handling and progress events. `core/job_store.py` atomically persists API job snapshots as JSON under the user's local data root; work directories are isolated by validated job ID. The UI polls `/api/jobs/{job_id}` and serves exports through guarded file routes. `web/vite.config.ts` proxies relative `/api` requests to the local API, so browser code does not call a browser-side localhost service.
+`core/models.py` defines the Pydantic contracts. `core/pipeline.py` owns orchestration, per-clip error handling and progress events. `core/job_store.py` atomically persists API job snapshots as JSON under the user's local data root; work directories are isolated by validated job ID. The UI polls `/api/jobs/{job_id}`, serves exports through guarded file routes, and removes an export plus ASS sidecar through `DELETE /api/clips/{clip_id}`. `web/vite.config.ts` proxies relative `/api` requests to the local API, so browser code does not call a browser-side localhost service.
 
 ### Implemented modules
 
 - **`core/ingest.py`** — validates supported local video extensions and YouTube/Twitch hosts; probes local metadata with shell-free ffprobe arguments; prefers word-timed YouTube JSON3 captions; downloads audio-only for remote analysis; streams FFmpeg PCM in windows for RMS/loudness peak detection; and uses faster-whisper with `device="cpu"`, `compute_type="int8"`, and word timestamps when no caption fast-path is available.
-- **`core/brain.py`** — routes to Ollama's native `/api/chat` API at `http://localhost:11434` or Google's Gemini `generateContent` API. It combines timed transcript, detected peaks and bounded custom direction, asks for a JSON clip envelope, validates every candidate, rejects out-of-source/improper-duration ranges, ranks by score and drops near-duplicate intervals. Gemini is opt-in through `GEMINI_API_KEY` or an explicit in-memory request value; the secret is excluded from serialized job requests.
+- **`core/brain.py` + `core/settings_store.py`** — route to Ollama, Gemini, OpenAI, Anthropic, Groq or OpenRouter; combine timed transcript, detected peaks and bounded creative direction; validate, rank and de-duplicate returned clip candidates. The local settings store persists model/base URL and API keys with owner-only file permissions where supported. Public settings/runtime responses reveal only configuration flags, never key values. Gemini's default is `gemini-3.8-flash`.
 - **`core/reframe.py`** — lazily imports MediaPipe/OpenCV and samples frames for a smoothed face trajectory. It generates filter graphs for Auto Face-Track 9:16, Podcast Split-Screen, Gaming Webcam + Gameplay and Fit-Blur. Missing face tracking falls back to a safe center crop. Podcast Split-Screen currently stacks the source's left and right halves; automatic active-speaker identification is not implemented. Gaming uses face detections to estimate a webcam crop; unusual inset geometry may need manual source/layout review.
 - **`core/captions.py`** — writes clip-relative ASS events using word times. The entire phrase remains visible while the active word changes color. Four presets are provided: Hormozi Bold, Clean Minimal, Gaming Neon and Podcast Classic; a suggested-caption fallback is available when there are no timed words.
-- **`core/render.py`** — tries yt-dlp's selected time-range download for each remote clip and falls back to a full-source download if the extractor cannot provide a range. Local cuts use FFmpeg seek/duration options. ASS is burned in; audio uses one-pass `loudnorm=I=-14:TP=-1.5:LRA=11`; encoder discovery prefers AMF, then detected NVENC, then libx264, and an actual hardware render failure retries with libx264 when listed. All FFmpeg calls use argument arrays and timeouts.
-- **`api/server.py` + `web/`** — multipart file upload or supported URL entry; Ollama/Gemini selection; layout/caption/export controls; custom direction; polling progress; local status/runtime display; and preview/download cards. The palette uses deep navy, warm ivory, muted gold, indigo and sky blue only; there is no green UI state color.
+- **`core/render.py` + `core/encoder.py`** — try yt-dlp's selected time-range download and fall back to a full source when needed. ASS is burned in; audio uses one-pass `loudnorm=I=-14:TP=-1.5:LRA=11`. A listed AMF/NVENC encoder must pass a real one-frame FFmpeg encode before selection; probe or later render failures fall back to `libx264` when listed. FFmpeg calls use argument arrays and timeouts.
+- **`api/server.py` + `web/`** — multipart upload or supported URL entry; six provider choices with a masked local Settings drawer and Save & Test; clip progress/preview/download/delete; and a charcoal/graphite/ivory/sand/gold/terracotta editorial palette with monospace telemetry and no green states. When `web/dist` exists, FastAPI serves it from `/` with client-route fallback while API and docs routes remain available.
 - **`core/cli.py`, `core/mcp_server.py`** — terminal and MCP adapters for the same pipeline. MCP is exposed over stdio and is launched with `python -m core.mcp_server` (or `frameforge-mcp`).
 - **`test_pipeline.py`** — deterministic mocked mode by default and a `--live` mode. Mocked checks exercise the full typed pipeline without real FFmpeg, an LLM, network access or ASR weights. Live mode probes encoders, checks Ollama `/api/tags` without a model pull, creates/renders/probes a 15-second synthetic A/V sample, and can additionally process `--source` end-to-end.
 
@@ -55,7 +55,7 @@ MCP tools / stdio ──────────────┘           │
 
 ## 5. Setup and verification
 
-`setup.bat` requires CPython 3.11 x64, FFmpeg/ffprobe, Node/npm and installs the pinned runtime (including MCP 2.3.0) in `.venv`, then installs the web lockfile and probes the local encoder listing. The Windows setup aligns and replaces MediaPipe's GUI OpenCV wheel with the headless build. `run.bat` starts the local API/UI.
+`setup.bat` requires CPython 3.11 x64, FFmpeg/ffprobe and Node/npm; it installs the pinned runtime (including MCP and `python-dotenv`), builds `web/dist`, then probes actual one-frame hardware encoding with CPU fallback. The Windows setup replaces MediaPipe's GUI OpenCV wheel with the matching headless build. `run.bat` starts the local API, which serves the built UI. On Linux, `run.sh` activates the prepared `.venv` and serves the UI/API on `127.0.0.1:8000`.
 
 Sandbox checks run without a Windows or FFmpeg claim:
 
