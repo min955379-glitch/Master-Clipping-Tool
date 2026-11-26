@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from core.encoder import EncoderProbeError, detect_encoder
+from core.env import load_local_env
 from core.models import CaptionPreset, ExportPreset, JobRequest, ProviderName, ReframeMode
 from core.pipeline import run_pipeline
+from core.settings_store import provider_config, public_settings
 
 
 def create_server() -> Any:
@@ -54,9 +57,7 @@ def create_server() -> Any:
 
     @server.tool()
     def get_local_runtime() -> dict[str, Any]:
-        """Report H.264 encoder selection and whether the opt-in Gemini key is configured."""
-        import os
-
+        """Report encoder selection and provider configuration without revealing secrets."""
         try:
             selection = detect_encoder(os.environ.get("FFMPEG_PATH", "ffmpeg"))
             encoder = {
@@ -67,10 +68,14 @@ def create_server() -> Any:
             }
         except EncoderProbeError as exc:
             encoder = {"available": False, "error": str(exc)}
+        settings = public_settings()
         return {
             "encoder": encoder,
-            "gemini_configured": bool(os.environ.get("GEMINI_API_KEY")),
-            "ollama_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+            "providers_configured": {
+                name: bool(config.get("configured"))
+                for name, config in settings["providers"].items()
+            },
+            "ollama_url": provider_config(ProviderName.OLLAMA)["base_url"],
         }
 
     return server
@@ -78,6 +83,7 @@ def create_server() -> Any:
 
 def main() -> None:
     """Run the stdio MCP transport used by local MCP hosts."""
+    load_local_env()
     create_server().run()
 
 

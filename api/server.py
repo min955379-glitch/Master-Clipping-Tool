@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import re
 import sys
@@ -15,9 +17,15 @@ from urllib.parse import quote
 import anyio
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
+from core.brain import test_provider_connection
 from core.encoder import EncoderProbeError, detect_encoder
+from core.env import load_local_env
 from core.ingest import ALLOWED_VIDEO_SUFFIXES
 from core.job_store import JobStore, StoredJob
 from core.models import (
@@ -30,6 +38,15 @@ from core.models import (
     ReframeMode,
 )
 from core.pipeline import run_pipeline
+from core.settings_store import (
+    InvalidProviderSettingsError,
+    SettingsStoreError,
+    provider_config,
+    public_settings,
+    save_provider_settings,
+)
+
+load_local_env()
 
 APP_VERSION = "0.3.0"
 MAX_UPLOAD_BYTES = int(os.environ.get("FRAMEFORGE_MAX_UPLOAD_BYTES", str(16 * 1024**3)))
@@ -39,6 +56,7 @@ _job_semaphore = threading.Semaphore(1)
 
 class ApiClip(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    clip_id: str
     start: float
     end: float
     virality_score: float
@@ -65,11 +83,40 @@ class ApiJob(BaseModel):
     error: str | None = None
 
 
+class ProviderTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    provider: ProviderName
+    model: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(default="", max_length=2000)
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    clear_api_key: bool = False
+
+
 app = FastAPI(
     title="All-in-One AI Video Clipping Studio",
     version=APP_VERSION,
     description="Local-first video clipping studio API.",
 )
+
+
+def _clip_id(job_id: str, file_name: str) -> str:
+    payload = f"{job_id}/{file_name}".encode()
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_clip_id(clip_id: str) -> tuple[str, str] | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,512}", clip_id or ""):
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(clip_id + "=" * (-len(clip_id) % 4)).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    job_id, separator, file_name = decoded.partition("/")
+    if not separator or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", job_id):
+        return None
+    if Path(file_name).name != file_name or not re.fullmatch(r"clip-[A-Za-z0-9_.-]+\.mp4", file_name, re.IGNORECASE):
+        return None
+    return job_id, file_name
 
 
 def _api_job(record: StoredJob) -> ApiJob:
@@ -81,6 +128,7 @@ def _api_job(record: StoredJob) -> ApiJob:
             file_name = clip.render.path.name
             clip_items.append(
                 ApiClip(
+                    clip_id=_clip_id(record.job_id, file_name),
                     start=clip.candidate.start,
                     end=clip.candidate.end,
                     virality_score=clip.candidate.virality_score,
@@ -187,10 +235,67 @@ def health() -> dict[str, str]:
     return {"status": "ok", "version": APP_VERSION, "pipeline": "ready"}
 
 
+@app.get("/api/settings", tags=["settings"])
+def get_settings() -> dict[str, object]:
+    """Return saved provider options and availability flags without key material."""
+    try:
+        return public_settings()
+    except SettingsStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _safe_provider_error(error: Exception, secrets: tuple[str, ...]) -> str:
+    message = str(error).strip()
+    for secret in sorted({item for item in secrets if item}, key=len, reverse=True):
+        message = message.replace(secret, "[redacted]")
+    return f"Provider test failed: {message[:900] or 'Unknown provider error.'}"
+
+
+@app.post("/api/settings/test", tags=["settings"])
+def save_and_test_provider(request: ProviderTestRequest) -> dict[str, object]:
+    """Persist the selected provider configuration, then make a lightweight test call."""
+    submitted_key = request.api_key.get_secret_value() if request.api_key is not None else None
+    try:
+        settings = save_provider_settings(
+            request.provider,
+            model=request.model,
+            base_url=request.base_url,
+            api_key=submitted_key,
+            clear_api_key=request.clear_api_key,
+        )
+        config = provider_config(request.provider)
+    except InvalidProviderSettingsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SettingsStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        message = test_provider_connection(
+            request.provider,
+            model=config["model"],
+            base_url=config["base_url"],
+            api_key=config["api_key"] or None,
+            timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001 - provider clients can raise transport-specific errors.
+        return {
+            "ok": False,
+            "provider": request.provider.value,
+            "message": _safe_provider_error(exc, (submitted_key or "", config["api_key"])),
+            "settings": settings,
+        }
+    return {"ok": True, "provider": request.provider.value, "message": message, "settings": settings}
+
+
 @app.get("/api/runtime", tags=["system"])
 def runtime_status() -> dict[str, object]:
-    """Report local optional-provider and encoder availability without failing health."""
-    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    """Report local provider and encoder availability without failing health."""
+    try:
+        providers = public_settings()["providers"]
+        ollama_url = provider_config(ProviderName.OLLAMA)["base_url"]
+    except SettingsStoreError:
+        providers = {}
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     try:
         encoder = detect_encoder(os.environ.get("FFMPEG_PATH", "ffmpeg"))
         encoder_info: dict[str, object] = {
@@ -201,10 +306,18 @@ def runtime_status() -> dict[str, object]:
         }
     except EncoderProbeError as exc:
         encoder_info = {"available": False, "error": str(exc)}
+    gemini = providers.get(ProviderName.GEMINI.value, {}) if isinstance(providers, dict) else {}
     return {
         "python": sys.version.split()[0],
         "ollama_url": ollama_url,
-        "gemini_configured": bool(os.environ.get("GEMINI_API_KEY")),
+        "gemini_configured": bool(gemini.get("configured")) if isinstance(gemini, dict) else False,
+        "providers_configured": {
+            name: bool(config.get("configured"))
+            for name, config in providers.items()
+            if isinstance(config, dict)
+        }
+        if isinstance(providers, dict)
+        else {},
         "encoder": encoder_info,
     }
 
@@ -319,3 +432,57 @@ def download_clip(job_id: str, file_name: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Export file is missing.")
     return FileResponse(path, media_type="video/mp4", filename=safe_name)
+
+
+@app.delete("/api/clips/{clip_id}", tags=["clips"])
+def delete_clip(clip_id: str) -> dict[str, object]:
+    """Remove one recorded export and its ASS sidecar from both disk and job state."""
+    parsed = _decode_clip_id(clip_id)
+    if parsed is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    job_id, file_name = parsed
+    record = store.get(job_id)
+    if record is None or record.result is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    match = next((clip for clip in record.result.clips if clip.render.path.name == file_name), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+
+    job_root = store.work_dir(job_id).resolve()
+    video_path = match.render.path.resolve()
+    caption_path = job_root / "captions" / f"{video_path.stem}.ass"
+    paths = (video_path, caption_path.resolve())
+    if any(not path.is_relative_to(job_root) for path in paths):
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    try:
+        for path in paths:
+            path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not delete clip files: {exc}") from exc
+
+    remaining = [clip for clip in record.result.clips if clip.render.path.name != file_name]
+    updated_result = record.result.model_copy(update={"clips": remaining})
+    try:
+        store.update(job_id, result=updated_result)
+    except (OSError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=500, detail="Clip files were removed but job state could not be updated.") from exc
+    return {"deleted": True, "clip_id": clip_id}
+
+
+class SPAStaticFiles(StaticFiles):
+    """Serve the Vite build and fall back to its entry point for client routes."""
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        if path in {"api", "docs", "openapi.json"} or path.startswith(("api/", "docs/")):
+            raise StarletteHTTPException(status_code=404)
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or Path(path).suffix:
+                raise
+            return await super().get_response("index.html", scope)
+
+
+WEB_DIST = Path(__file__).resolve().parents[1] / "web" / "dist"
+if (WEB_DIST / "index.html").is_file():
+    app.mount("/", SPAStaticFiles(directory=str(WEB_DIST), html=True), name="studio-web")

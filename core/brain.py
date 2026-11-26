@@ -1,4 +1,4 @@
-"""Provider-neutral clip discovery using local Ollama or opt-in Google Gemini."""
+"""Provider-neutral clip discovery across local Ollama and configurable AI APIs."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from core.models import AudioPeak, ClipCandidate, IngestResult, JobRequest, ProviderName, Word
+from core.settings_store import API_KEY_ENV, DEFAULT_PROVIDER_SETTINGS, provider_config
 
 DEFAULT_MODELS = {
-    ProviderName.OLLAMA: "qwen2.5:7b",
-    ProviderName.GEMINI: "gemini-2.5-flash",
+    ProviderName(name): values["model"] for name, values in DEFAULT_PROVIDER_SETTINGS.items()
 }
 MAX_PROVIDER_RESPONSE_BYTES = 2_000_000
 MAX_TRANSCRIPT_CHARS = 72_000
@@ -74,9 +74,23 @@ def _read_response(request: urllib.request.Request, timeout: float, opener: Call
         except (OSError, ValueError) as read_error:
             detail = f"Could not read provider error body: {read_error}"
         safe_detail = detail[:500]
+        safe_reason = str(exc.reason)
+        secret_values: set[str] = set()
+        query_key = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query).get("key", [])
+        secret_values.update(query_key)
+        for header_name, header_value in request.header_items():
+            if header_name.lower() in {"authorization", "x-api-key", "x-goog-api-key"}:
+                secret_values.add(header_value)
+                if header_name.lower() == "authorization" and header_value.lower().startswith("bearer "):
+                    secret_values.add(header_value[7:].strip())
+        for secret in sorted(secret_values, key=len, reverse=True):
+            if secret:
+                safe_detail = safe_detail.replace(secret, "[redacted]")
+                safe_reason = safe_reason.replace(secret, "[redacted]")
         if "key=" in request.full_url:
             safe_detail = re.sub(r"(?i)(key=)[^&\s]+", r"\1[redacted]", safe_detail)
-        raise BrainError(f"AI provider returned HTTP {exc.code}: {safe_detail or exc.reason}") from exc
+            safe_reason = re.sub(r"(?i)(key=)[^&\s]+", r"\1[redacted]", safe_reason)
+        raise BrainError(f"AI provider returned HTTP {exc.code}: {safe_detail or safe_reason}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         raise BrainError(f"Could not reach the AI provider: {reason}") from exc
@@ -149,6 +163,7 @@ def call_gemini(
     *,
     api_key: str | None = None,
     model: str | None = None,
+    base_url: str = "",
     timeout: float = 120,
     opener: Callable[..., Any] | None = None,
 ) -> str:
@@ -157,11 +172,13 @@ def call_gemini(
     if not key:
         raise BrainError("Gemini is opt-in: set GEMINI_API_KEY or provide an API key in the job settings.")
     chosen_model = model or DEFAULT_MODELS[ProviderName.GEMINI]
+    base = _clean_api_base(base_url, ProviderName.GEMINI)
     endpoint = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
+        base
+        + ("" if base.endswith("/models") else "/models")
+        + "/"
         + urllib.parse.quote(chosen_model, safe="")
-        + ":generateContent?"
-        + urllib.parse.urlencode({"key": key})
+        + ":generateContent"
     )
     payload = _post_json(
         endpoint,
@@ -174,6 +191,7 @@ def call_gemini(
         },
         timeout=timeout,
         opener=opener,
+        headers={"x-goog-api-key": key},
     )
     candidates = payload.get("candidates") or []
     try:
@@ -188,30 +206,250 @@ def call_gemini(
     return text
 
 
+def _provider_key(provider: ProviderName, api_key: str | None) -> str:
+    key = (api_key or "").strip()
+    if not key:
+        environment_name = API_KEY_ENV.get(provider.value)
+        key = os.environ.get(environment_name, "").strip() if environment_name else ""
+    if not key:
+        raise BrainError(f"{provider.value.title()} API key is not configured. Add it in Settings or the local .env file.")
+    return key
+
+
+def _clean_api_base(base_url: str, provider: ProviderName) -> str:
+    default = DEFAULT_PROVIDER_SETTINGS[provider.value]["base_url"]
+    raw = (base_url or default).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise BrainError(f"{provider.value.title()} base URL must use http:// or https:// and include a host.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise BrainError("Provider base URLs cannot include credentials, query parameters, or fragments.")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")).rstrip("/")
+
+
+def _chat_text(payload: dict[str, Any], provider: str) -> str:
+    try:
+        content = payload["choices"][0]["message"]["content"]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise BrainError(f"{provider.title()} returned no usable chat completion.") from exc
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise BrainError(f"{provider.title()} returned no text content.")
+    return content
+
+
+def call_openai_compatible(
+    prompt: str,
+    *,
+    provider: ProviderName,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str = "",
+    timeout: float = 120,
+    opener: Callable[..., Any] | None = None,
+) -> str:
+    """Call OpenAI, Groq, or OpenRouter through their compatible chat APIs."""
+    if provider not in {ProviderName.OPENAI, ProviderName.GROQ, ProviderName.OPENROUTER}:
+        raise BrainError(f"{provider.value} does not use the OpenAI-compatible chat API.")
+    key = _provider_key(provider, api_key)
+    base = _clean_api_base(base_url, provider)
+    endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
+    payload = _post_json(
+        endpoint,
+        {
+            "model": model or DEFAULT_MODELS[provider],
+            "messages": [
+                {"role": "system", "content": "You identify compelling, self-contained video clips. Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+        },
+        timeout=timeout,
+        opener=opener,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    return _chat_text(payload, provider.value)
+
+
+def _anthropic_messages_url(base_url: str, provider: ProviderName) -> str:
+    base = _clean_api_base(base_url, provider)
+    if base.endswith("/v1/messages"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/messages"
+    return base + "/v1/messages"
+
+
+def call_anthropic(
+    prompt: str,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str = "",
+    timeout: float = 120,
+    opener: Callable[..., Any] | None = None,
+) -> str:
+    """Call Anthropic's Messages API with no SDK dependency."""
+    provider = ProviderName.ANTHROPIC
+    key = _provider_key(provider, api_key)
+    endpoint = _anthropic_messages_url(base_url, provider)
+    payload = _post_json(
+        endpoint,
+        {
+            "model": model or DEFAULT_MODELS[provider],
+            "max_tokens": 4096,
+            "system": "You identify compelling, self-contained video clips. Return only valid JSON.",
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=timeout,
+        opener=opener,
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+    )
+    content = payload.get("content") or []
+    text = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    if not text.strip():
+        raise BrainError("Anthropic returned no text content.")
+    return text
+
+
+def test_provider_connection(
+    provider: ProviderName | str,
+    *,
+    model: str,
+    base_url: str = "",
+    api_key: str | None = None,
+    timeout: float = 20,
+    opener: Callable[..., Any] | None = None,
+) -> str:
+    """Send a small real request and return a safe, human-readable pass message."""
+    name = ProviderName(provider)
+    chosen_model = (model or DEFAULT_MODELS[name]).strip()
+    prompt = "Reply with the single word OK."
+    if name == ProviderName.OLLAMA:
+        root = _clean_base_url(base_url)
+        payload = _post_json(
+            root + "/api/chat",
+            {
+                "model": chosen_model,
+                "stream": False,
+                "options": {"num_predict": 8, "temperature": 0},
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=timeout,
+            opener=opener,
+        )
+        message = payload.get("message") or {}
+        text = message.get("content") if isinstance(message, dict) else payload.get("response")
+    elif name == ProviderName.GEMINI:
+        key = _provider_key(name, api_key)
+        base = _clean_api_base(base_url, name)
+        endpoint = (
+            base
+            + ("" if base.endswith("/models") else "/models")
+            + "/"
+            + urllib.parse.quote(chosen_model, safe="")
+            + ":generateContent"
+        )
+        payload = _post_json(
+            endpoint,
+            {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 8, "temperature": 0},
+            },
+            timeout=timeout,
+            opener=opener,
+            headers={"x-goog-api-key": key},
+        )
+        candidates = payload.get("candidates") or []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        text = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+    elif name == ProviderName.ANTHROPIC:
+        key = _provider_key(name, api_key)
+        endpoint = _anthropic_messages_url(base_url, name)
+        payload = _post_json(
+            endpoint,
+            {
+                "model": chosen_model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=timeout,
+            opener=opener,
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+        content = payload.get("content") or []
+        text = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    else:
+        key = _provider_key(name, api_key)
+        base = _clean_api_base(base_url, name)
+        endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
+        payload = _post_json(
+            endpoint,
+            {"model": chosen_model, "max_tokens": 8, "messages": [{"role": "user", "content": prompt}]},
+            timeout=timeout,
+            opener=opener,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        text = _chat_text(payload, name.value)
+    if not isinstance(text, str) or not text.strip():
+        raise BrainError(f"{name.value.title()} returned an empty test response.")
+    return f"Connected to {name.value.title()} ({chosen_model})."
+
+
 def route_provider(
     prompt: str,
     request: JobRequest,
     *,
     services: BrainServices | None = None,
 ) -> str:
-    """Route one request to the selected provider; no provider SDK is mandatory."""
+    """Route through the selected provider, using private saved settings as defaults."""
     opener = (services or BrainServices()).urlopen
     provider = request.provider
-    model = request.model or DEFAULT_MODELS[provider]
+    saved = provider_config(provider)
+    model = request.model or saved["model"] or DEFAULT_MODELS[provider]
+    api_key = request.api_key or saved["api_key"] or None
+    timeout = request.request_timeout_seconds
     if provider == ProviderName.OLLAMA:
+        configured_base = saved["base_url"]
+        default_base = DEFAULT_PROVIDER_SETTINGS[ProviderName.OLLAMA.value]["base_url"]
+        base_url = request.base_url
+        if not base_url or base_url.rstrip("/") == default_base.rstrip("/"):
+            base_url = configured_base or default_base
         return call_ollama(
             prompt,
-            base_url=request.base_url,
+            base_url=base_url,
             model=model,
-            timeout=request.request_timeout_seconds,
+            timeout=timeout,
             opener=opener,
         )
     if provider == ProviderName.GEMINI:
         return call_gemini(
             prompt,
-            api_key=request.api_key,
+            api_key=api_key,
             model=model,
-            timeout=request.request_timeout_seconds,
+            base_url=saved["base_url"],
+            timeout=timeout,
+            opener=opener,
+        )
+    if provider in {ProviderName.OPENAI, ProviderName.GROQ, ProviderName.OPENROUTER}:
+        return call_openai_compatible(
+            prompt,
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            base_url=saved["base_url"],
+            timeout=timeout,
+            opener=opener,
+        )
+    if provider == ProviderName.ANTHROPIC:
+        return call_anthropic(
+            prompt,
+            api_key=api_key,
+            model=model,
+            base_url=saved["base_url"],
+            timeout=timeout,
             opener=opener,
         )
     raise BrainError(f"Unsupported AI provider: {provider!r}")

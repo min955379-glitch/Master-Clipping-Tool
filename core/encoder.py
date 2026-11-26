@@ -1,7 +1,7 @@
 """Small FFmpeg H.264 encoder capability probe.
 
-This module has no third-party Python dependencies and is intentionally usable
-before the video pipeline is implemented.
+This module has no third-party Python dependencies and can be used by setup,
+API runtime reporting, and the rendering pipeline.
 """
 
 from __future__ import annotations
@@ -9,9 +9,11 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from os import PathLike, fspath
+from typing import Any
 
 ENCODER_PRIORITY = ("h264_amf", "h264_nvenc", "libx264")
 _HARDWARE_ENCODERS = frozenset(("h264_amf", "h264_nvenc"))
@@ -84,11 +86,13 @@ def probe_encoders(
     ffmpeg_executable: str | PathLike[str] = "ffmpeg",
     *,
     timeout_seconds: float = 10.0,
+    run: Callable[..., Any] | None = None,
 ) -> frozenset[str]:
     """Run FFmpeg's encoder listing and return the available encoder names."""
     executable = fspath(ffmpeg_executable)
+    runner = run or subprocess.run
     try:
-        result = subprocess.run(
+        result = runner(
             [executable, "-hide_banner", "-encoders"],
             capture_output=True,
             text=True,
@@ -118,15 +122,113 @@ def probe_encoders(
     return names
 
 
+def _probe_one_hardware_frame(
+    executable: str,
+    encoder: str,
+    *,
+    timeout_seconds: float,
+    run: Callable[..., Any],
+) -> tuple[bool, str]:
+    command = [
+        executable,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:d=0.1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{encoder} one-frame runtime probe timed out after {timeout_seconds:g} seconds"
+    except OSError as exc:
+        return False, f"{encoder} one-frame runtime probe could not start: {exc}"
+    if result.returncode == 0:
+        return True, ""
+    detail = (result.stderr or result.stdout or "no FFmpeg diagnostic output").strip()
+    return False, f"{encoder} one-frame runtime probe failed: {detail[-500:]}"
+
+
+def _detect_encoder_with_runner(
+    executable: str,
+    timeout_seconds: float,
+    runner: Callable[..., Any],
+) -> EncoderSelection:
+    names = probe_encoders(executable, timeout_seconds=timeout_seconds, run=runner)
+    supported = tuple(name for name in ENCODER_PRIORITY if name in names)
+    failures: list[str] = []
+    for name in ("h264_amf", "h264_nvenc"):
+        if name not in names:
+            continue
+        passed, detail = _probe_one_hardware_frame(
+            executable,
+            name,
+            timeout_seconds=timeout_seconds,
+            run=runner,
+        )
+        if passed:
+            provider = "AMD AMF" if name == "h264_amf" else "NVIDIA NVENC"
+            return EncoderSelection(
+                name=name,
+                hardware_accelerated=True,
+                reason=f"The {provider} one-frame runtime probe passed.",
+                available=supported,
+            )
+        failures.append(detail)
+
+    if "libx264" in names:
+        reason = (
+            "Hardware H.264 runtime probe failed (" + "; ".join(failures) + "); selecting CPU libx264."
+            if failures
+            else "Hardware H.264 encoders are unavailable; selecting CPU libx264."
+        )
+        return EncoderSelection(
+            name="libx264",
+            hardware_accelerated=False,
+            reason=reason,
+            available=supported,
+        )
+    if failures:
+        raise EncoderProbeError(
+            "No listed hardware encoder passed the one-frame runtime probe and libx264 is unavailable: "
+            + "; ".join(failures)
+        )
+    return select_encoder(names)
+
+
+@lru_cache(maxsize=8)
+def _cached_detect_encoder(executable: str, timeout_seconds: float) -> EncoderSelection:
+    return _detect_encoder_with_runner(executable, timeout_seconds, subprocess.run)
+
+
 def detect_encoder(
     ffmpeg_executable: str | PathLike[str] = "ffmpeg",
     *,
     timeout_seconds: float = 10.0,
+    run: Callable[..., Any] | None = None,
 ) -> EncoderSelection:
-    """Probe the configured FFmpeg executable and select a supported H.264 encoder."""
-    return select_encoder(
-        probe_encoders(ffmpeg_executable, timeout_seconds=timeout_seconds)
-    )
+    """Probe hardware with one frame and cache the default runtime result per process."""
+    executable = fspath(ffmpeg_executable)
+    if run is None:
+        return _cached_detect_encoder(executable, timeout_seconds)
+    return _detect_encoder_with_runner(executable, timeout_seconds, run)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -8,6 +8,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from core.env import load_local_env
 from core.models import (
     CaptionPreset,
     ExportPreset,
@@ -26,8 +27,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source", required=True, help="Local video path or YouTube/Twitch URL")
     parser.add_argument("--provider", choices=[item.value for item in ProviderName], default=ProviderName.OLLAMA.value)
-    parser.add_argument("--model", help="Optional Ollama or Gemini model override")
-    parser.add_argument("--base-url", default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--model", help="Optional provider model override")
+    parser.add_argument("--base-url", default="http://localhost:11434", help="Override the Ollama base URL")
     parser.add_argument("--direction", default="", help="Optional creative direction for clip selection")
     parser.add_argument("--language", help="Optional transcription language code")
     parser.add_argument("--layout", choices=[item.value for item in ReframeMode], default=ReframeMode.FACE_TRACK.value)
@@ -51,6 +52,7 @@ def _progress(event: PipelineProgress) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_local_env()
     args = _parser().parse_args(argv)
     try:
         request = JobRequest(

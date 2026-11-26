@@ -5,17 +5,22 @@ import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
+from unittest.mock import patch
 
 from core.brain import (
     BrainError,
     build_clip_prompt,
+    call_anthropic,
     call_gemini,
     call_ollama,
+    call_openai_compatible,
     parse_ranked_clips,
     rank_clips,
+    route_provider,
 )
 from core.captions import CaptionError, generate_ass, write_ass
 from core.encoder import EncoderSelection
@@ -348,9 +353,128 @@ class BrainTests(unittest.TestCase):
             return FakeResponse({"candidates": [{"content": {"parts": [{"text": "{\"clips\": []}"}]}}]})
 
         self.assertEqual(call_gemini("select clips", api_key="private-test-key", opener=opener), "{\"clips\": []}")
-        self.assertIn("key=private-test-key", requests[0].full_url)
+        self.assertEqual(requests[0].full_url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent")
+        self.assertEqual(requests[0].get_header("X-goog-api-key"), "private-test-key")
+        self.assertNotIn("private-test-key", requests[0].full_url)
         with self.assertRaises(BrainError):
             call_gemini("select clips", api_key="", opener=opener)
+
+    def test_openai_compatible_provider_uses_saved_style_base_url_and_auth_header(self) -> None:
+        requests: list[Any] = []
+
+        def opener(request: Any, timeout: float) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse({"choices": [{"message": {"content": "{\"clips\": []}"}}]})
+
+        content = call_openai_compatible(
+            "select clips",
+            provider=ProviderName.OPENROUTER,
+            api_key="private-openrouter-key",
+            model="openai/gpt-test",
+            base_url="https://proxy.example/v1/",
+            opener=opener,
+        )
+        self.assertEqual(content, "{\"clips\": []}")
+        request = requests[0]
+        self.assertEqual(request.full_url, "https://proxy.example/v1/chat/completions")
+        self.assertEqual(request.get_header("Authorization"), "Bearer private-openrouter-key")
+        self.assertEqual(json.loads(request.data)["model"], "openai/gpt-test")
+        self.assertNotIn("private-openrouter-key", request.full_url)
+
+    def test_provider_http_errors_redact_api_keys_echoed_in_response_bodies(self) -> None:
+        api_key = "private-openai-key"
+
+        def opener(request: Any, timeout: float) -> FakeResponse:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(f"invalid key {api_key}".encode()),
+            )
+
+        with self.assertRaises(BrainError) as error:
+            call_openai_compatible(
+                "select clips",
+                provider=ProviderName.OPENAI,
+                api_key=api_key,
+                base_url="https://api.openai.com/v1",
+                opener=opener,
+            )
+        self.assertNotIn(api_key, str(error.exception))
+        self.assertIn("[redacted]", str(error.exception))
+
+    def test_anthropic_messages_api_uses_custom_base_and_key_header(self) -> None:
+        requests: list[Any] = []
+
+        def opener(request: Any, timeout: float) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse({"content": [{"type": "text", "text": "{\"clips\": []}"}]})
+
+        content = call_anthropic(
+            "select clips",
+            api_key="private-anthropic-key",
+            model="claude-test",
+            base_url="https://proxy.example/api",
+            opener=opener,
+        )
+        self.assertEqual(content, "{\"clips\": []}")
+        request = requests[0]
+        self.assertEqual(request.full_url, "https://proxy.example/api/v1/messages")
+        self.assertEqual(request.get_header("X-api-key"), "private-anthropic-key")
+        self.assertEqual(json.loads(request.data)["model"], "claude-test")
+
+    def test_gemini_connection_test_sends_key_in_header_and_uses_configured_base(self) -> None:
+        from core.brain import test_provider_connection
+
+        requests: list[Any] = []
+
+        def opener(request: Any, timeout: float) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse({"candidates": [{"content": {"parts": [{"text": "OK"}]}}]})
+
+        message = test_provider_connection(
+            ProviderName.GEMINI,
+            model="gemini-test",
+            base_url="https://proxy.example/v1beta",
+            api_key="private-gemini-key",
+            opener=opener,
+        )
+        self.assertIn("Connected to Gemini", message)
+        self.assertEqual(requests[0].full_url, "https://proxy.example/v1beta/models/gemini-test:generateContent")
+        self.assertEqual(requests[0].get_header("X-goog-api-key"), "private-gemini-key")
+        self.assertNotIn("private-gemini-key", requests[0].full_url)
+
+    def test_route_provider_uses_persisted_settings_for_each_provider(self) -> None:
+        saved = {
+            "model": "persisted-model",
+            "base_url": "https://proxy.example/v1",
+            "api_key": "persisted-secret",
+        }
+        adapters = {
+            ProviderName.OLLAMA: "call_ollama",
+            ProviderName.GEMINI: "call_gemini",
+            ProviderName.OPENAI: "call_openai_compatible",
+            ProviderName.ANTHROPIC: "call_anthropic",
+            ProviderName.GROQ: "call_openai_compatible",
+            ProviderName.OPENROUTER: "call_openai_compatible",
+        }
+        for provider, adapter in adapters.items():
+            with self.subTest(provider=provider.value):
+                request = JobRequest(source="sample.mp4", provider=provider)
+                with (
+                    patch("core.brain.provider_config", return_value=saved) as load_settings,
+                    patch(f"core.brain.{adapter}", return_value="provider response") as call,
+                ):
+                    result = route_provider("pick clips", request)
+                self.assertEqual(result, "provider response")
+                load_settings.assert_called_once_with(provider)
+                self.assertEqual(call.call_args.kwargs["model"], saved["model"])
+                if provider != ProviderName.OLLAMA:
+                    self.assertEqual(call.call_args.kwargs["api_key"], saved["api_key"])
+                    self.assertEqual(call.call_args.kwargs["base_url"], saved["base_url"])
+                if provider in {ProviderName.OPENAI, ProviderName.GROQ, ProviderName.OPENROUTER}:
+                    self.assertEqual(call.call_args.kwargs["provider"], provider)
 
     def test_provider_routing_is_injectable_without_network(self) -> None:
         request = JobRequest(source="sample.mp4", provider=ProviderName.OLLAMA)

@@ -14,6 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class ProviderName(str, Enum):
     OLLAMA = "ollama"
     GEMINI = "gemini"
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    GROQ = "groq"
+    OPENROUTER = "openrouter"
 
 
 class ReframeMode(str, Enum):

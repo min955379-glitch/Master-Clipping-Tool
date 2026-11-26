@@ -67,6 +67,11 @@ if errorlevel 1 (
   popd
   goto :npm_install_failed
 )
+call npm run build
+if errorlevel 1 (
+  popd
+  goto :npm_build_failed
+)
 popd
 
 echo.
@@ -127,8 +132,12 @@ goto :failed
 echo [ERROR] Web dependency installation failed. Review the npm output above.
 goto :failed
 
+:npm_build_failed
+echo [ERROR] The production UI build failed. Review the npm output above.
+goto :failed
+
 :encoder_probe_failed
-echo [ERROR] The FFmpeg probe found no supported H.264 encoder. Ensure libx264 is available.
+echo [ERROR] No usable H.264 encoder passed the runtime probe. Ensure libx264 is available.
 goto :failed
 
 :failed
